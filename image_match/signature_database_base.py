@@ -1,7 +1,10 @@
-from image_match.goldberg import ImageSignature
+import logging
 from itertools import product
 from operator import itemgetter
+
 import numpy as np
+
+from image_match.goldberg import ImageSignature
 
 
 class SignatureDatabaseBase(object):
@@ -78,7 +81,7 @@ class SignatureDatabaseBase(object):
         """
         raise NotImplementedError
 
-    def insert_single_record(self, rec):
+    def insert_single_record(self, rec, refresh_after=False):
         """Insert an image record.
 
         Must be implemented by derived class.
@@ -171,6 +174,7 @@ class SignatureDatabaseBase(object):
         if type(n_grid) is not int:
             raise TypeError('n_grid should be an integer')
 
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.k = k
         self.N = N
         self.n_grid = n_grid
@@ -401,7 +405,7 @@ def get_words(array, k, N):
 
     for i, pos in enumerate(word_positions):
         if pos + k <= array.shape[0]:
-            words[i] = array[pos:pos+k]
+            words[i] = array[pos:pos + k]
         else:
             temp = array[pos:].copy()
             temp.resize(k)
@@ -433,7 +437,7 @@ def words_to_int(word_array):
     width = word_array.shape[1]
 
     # Three states (-1, 0, 1)
-    coding_vector = 3**np.arange(width)
+    coding_vector = 3 ** np.arange(width)
 
     # The 'plus one' here makes all digits positive, so that the
     # integer represntation is strictly non-negative and unique

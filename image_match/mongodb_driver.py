@@ -1,15 +1,22 @@
-from signature_database_base import SignatureDatabaseBase
-from signature_database_base import normalized_distance
-from multiprocessing import cpu_count, Process, Queue
-from multiprocessing.managers import Queue as managerQueue
+import logging
+from multiprocessing import Process, Queue
+from multiprocessing.managers import queue as managerQueue
+
 import numpy as np
+import pymongo
+
+from .signature_database_base import SignatureDatabaseBase
+from .signature_database_base import normalized_distance
+
+logger = logging.getLogger(__name__)
 
 
 class SignatureMongo(SignatureDatabaseBase):
     """MongoDB driver for image-match
 
     """
-    def __init__(self, collection, *args, **kwargs):
+
+    def __init__(self, collection, best_count_of_result=20, count_must_equal_n=True, *args, **kwargs):
         """Additional MongoDB setup
 
         Args:
@@ -41,11 +48,57 @@ class SignatureMongo(SignatureDatabaseBase):
 
         super(SignatureMongo, self).__init__(*args, **kwargs)
 
+        self.mongo_args = None
+
+        self.best_count_of_result = best_count_of_result
+        self.count_must_equal_n = count_must_equal_n
+
+    def insert_single_record(self, rec, refresh_after=False):
+        self.collection.insert(rec)
+
+        # if the collection has no indexes (except possibly '_id'), build them
+        if len(self.collection.index_information()) <= 1:
+            self.index_collection()
+
+    def index_collection(self):
+        """Index a collection on words.
+
+        """
+        # Index on words
+        self.index_names = [field for field in self.collection.find_one({}).keys()
+                            if field.find('simple') > -1]
+        for name in self.index_names:
+            self.collection.create_index(name)
+
+    def _set_mongo_client_args(self):
+        try:
+            if self.mongo_args is None:
+                self.mongo_args = CollectionArgs()
+                self.mongo_args.collection = self.collection.name
+                self.mongo_args.database = self.collection.database.name
+
+                _client = self.collection.database.client
+
+                self.mongo_args.client_host = _client.client_args["host"]
+                self.mongo_args.client_port = _client.client_args["port"]
+                self.mongo_args.client_document_class = _client.client_args["document_class"]
+                self.mongo_args.client_kwargs = _client.client_args["kwargs"]
+                self.mongo_args.client_connect = _client.client_args["connect"]
+                self.mongo_args.client_tz_aware = _client.client_args["tz_aware"]
+        except Exception as e:
+            self.logger.error(e, exc_info=1)
+            self.mongo_args = None
+
     def search_single_record(self, rec, n_parallel_words=1, word_limit=None,
                              process_timeout=None, maximum_matches=1000, filter=None):
-        if n_parallel_words is None:
-            n_parallel_words = cpu_count()
+        if n_parallel_words is None or n_parallel_words > 1:
+            return self._search_single_record_with_multi_processing(rec, n_parallel_words, word_limit,
+                                                                    process_timeout, maximum_matches)
 
+        return self._search_single_record_with_current_processing(rec, word_limit, maximum_matches)
+
+    def _search_single_record_with_multi_processing(self, rec, n_parallel_words, word_limit, process_timeout,
+                                                    maximum_matches):
         if word_limit is None:
             word_limit = self.N
 
@@ -63,7 +116,11 @@ class SignatureMongo(SignatureDatabaseBase):
         # create a set of unique results, using MongoDB _id field
         unique_results = set()
 
-        l = list()
+        # init mongo collection args
+        self._set_mongo_client_args()
+        _mongo_args = self.mongo_args or self.collection
+
+        sorted_queue = SortedQuene()
 
         while True:
 
@@ -79,7 +136,7 @@ class SignatureMongo(SignatureDatabaseBase):
                     p.append(Process(target=get_next_match,
                                      args=(results_q,
                                            word_pair,
-                                           self.collection,
+                                           _mongo_args,
                                            np.array(rec['signature']),
                                            self.distance_cutoff,
                                            maximum_matches)))
@@ -99,10 +156,10 @@ class SignatureMongo(SignatureDatabaseBase):
                 if results == 'STOP':
                     num_processes -= 1
                 else:
-                    for key in results.keys():
-                        if key not in unique_results:
-                            unique_results.add(key)
-                            l.append(results[key])
+                    key = results["id"]
+                    if key not in unique_results:
+                        unique_results.add(key)
+                        sorted_queue.append(results["dist"], results)
 
             for process in p:
                 process.join()
@@ -111,28 +168,96 @@ class SignatureMongo(SignatureDatabaseBase):
             if queue_empty:
                 break
 
-        return l
+        return sorted_queue.pop_asc_list(top_n=self.best_count_of_result, count_must_equal_n=self.count_must_equal_n)
+
+    def _search_single_record_with_current_processing(self, rec, word_limit, maximum_matches):
+        if word_limit is None:
+            word_limit = self.N
+
+        field_list = ({field_name: rec[field_name]} for field_name in self.index_names[:word_limit])
+
+        # create a set of unique results, using MongoDB _id field
+        unique_results = set()
+
+        sorted_queue = SortedQuene()
+
+        for word_pair in field_list:
+            try:
+                result_list = get_next_match_in_current_processing(
+                    word_pair,
+                    self.collection,
+                    np.array(rec['signature']),
+                    self.distance_cutoff,
+                    maximum_matches
+                )
+                if result_list:
+                    for results in result_list:
+                        key = results["id"]
+                        if key not in unique_results:
+                            unique_results.add(key)
+                            sorted_queue.append(results["dist"], results)
+
+            except Exception as e:
+                self.logger.error(e, exc_info=1)
+
+        return sorted_queue.pop_asc_list(top_n=self.best_count_of_result, count_must_equal_n=self.count_must_equal_n)
 
 
-    def insert_single_record(self, rec):
-        self.collection.insert(rec)
+class CollectionArgs(object):
+    __slots__ = ("client_host", "client_port", "client_document_class", "client_tz_aware",
+                 "client_connect", "client_kwargs", "database", "collection")
 
-        # if the collection has no indexes (except possibly '_id'), build them
-        if len(self.collection.index_information()) <= 1:
-            self.index_collection()
-
-    def index_collection(self):
-        """Index a collection on words.
-
-        """
-        # Index on words
-        self.index_names = [field for field in self.collection.find_one({}).keys()
-                            if field.find('simple') > -1]
-        for name in self.index_names:
-            self.collection.create_index(name)
+    def __init__(self):
+        self.client_host = None
+        self.client_port = None
+        self.client_document_class = None
+        self.client_tz_aware = None
+        self.client_connect = None
+        self.client_kwargs = None
+        self.database = ""
+        self.collection = ""
 
 
-def get_next_match(result_q, word, collection, signature, cutoff=0.5, max_in_cursor=100):
+class SortedQuene(object):
+    __slots__ = ("_dict", "_score_set")
+
+    def __init__(self):
+        self._dict = {}
+        self._score_set = set()
+
+    def append(self, score, obj):
+        # 添加
+        if score not in self._dict:
+            self._dict[score] = []
+
+        self._dict[score].append(obj)
+
+        # 排序
+        self._score_set.add(score)
+
+    def pop_asc_list(self, top_n=100, count_must_equal_n=True):
+        result = []
+        _score_list = list(self._score_set)
+        _score_list.sort()
+        for _ in range(top_n):
+            if not _score_list:
+                break
+
+            score = _score_list.pop(0)
+            if score in self._score_set:
+                self._score_set.remove(score)
+            result.extend(self._dict.pop(score))
+
+            if len(result) >= top_n:
+                break
+
+        if count_must_equal_n and len(result) >= top_n:
+            return result[:top_n]
+
+        return result
+
+
+def get_next_match(result_q, word, collection_args, signature, cutoff=0.5, max_in_cursor=100):
     """Given a cursor, iterate through matches
 
     Scans a cursor for word matches below a distance threshold.
@@ -144,30 +269,86 @@ def get_next_match(result_q, word, collection, signature, cutoff=0.5, max_in_cur
     Args:
         result_q (multiprocessing.Queue): a multiprocessing queue in which to queue results
         word (dict): {word_name: word_value} dict to scan against
-        collection (collection): a pymongo collection
+        collection_args (CollectionArgs|collection): pymongo collection args or a pymongo collection
         signature (numpy.ndarray): signature array to match against
         cutoff (Optional[float]): normalized distance limit (default 0.5)
         max_in_cursor (Optional[int]): if more than max_in_cursor matches are in the cursor,
             ignore this cursor; this column is not discriminatory (default 100)
 
     """
+    client = None
+    try:
+        if isinstance(collection_args, CollectionArgs):
+            client = pymongo.MongoClient(
+                host=collection_args.client_host,
+                port=collection_args.client_port,
+                document_class=collection_args.client_document_class,
+                tz_aware=collection_args.client_tz_aware,
+                connect=collection_args.client_connect,
+                **collection_args.client_kwargs)
+            collection = client[collection_args.database][collection_args.collection]
+        else:
+            collection = collection_args
+
+        curs = collection.find(word, projection=['_id', 'signature', 'path', 'metadata'])
+
+        # if the cursor has many matches, then it's probably not a huge help. Get the next one.
+        if curs.count() > max_in_cursor:
+            result_q.put('STOP')
+            return
+
+        while True:
+            try:
+                rec = curs.next()
+                dist = normalized_distance(np.reshape(signature, (1, signature.size)), np.array(rec['signature']))[0]
+                result_q.put({'dist': dist, 'path': rec['path'], 'id': rec['_id'],
+                              'metadata': rec.get('metadata', {})})
+            except StopIteration:
+                # do nothing...the cursor is exhausted
+                break
+        result_q.put('STOP')
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception as e:
+                logger.error(e, exc_info=1)
+
+
+def get_next_match_in_current_processing(word, collection_args, signature, cutoff=0.5, max_in_cursor=100):
+    """Given a cursor, iterate through matches
+
+    Scans a cursor for word matches below a distance threshold.
+    Exhausts a cursor, possibly enqueuing many matches
+    Note that placing this function outside the SignatureCollection
+    class breaks encapsulation.  This is done for compatibility with
+    multiprocessing.
+
+    Args:
+        word (dict): {word_name: word_value} dict to scan against
+        collection_args (collection): pymongo collection args or a pymongo collection
+        signature (numpy.ndarray): signature array to match against
+        cutoff (Optional[float]): normalized distance limit (default 0.5)
+        max_in_cursor (Optional[int]): if more than max_in_cursor matches are in the cursor,
+            ignore this cursor; this column is not discriminatory (default 100)
+
+    """
+    result = []
+    collection = collection_args
+
     curs = collection.find(word, projection=['_id', 'signature', 'path', 'metadata'])
 
     # if the cursor has many matches, then it's probably not a huge help. Get the next one.
     if curs.count() > max_in_cursor:
-        result_q.put('STOP')
-        return
+        return result
 
-    matches = dict()
     while True:
         try:
             rec = curs.next()
             dist = normalized_distance(np.reshape(signature, (1, signature.size)), np.array(rec['signature']))[0]
-            if dist < cutoff:
-                matches[rec['_id']] = {'dist': dist, 'path': rec['path'], 'id': rec['_id'], 'metadata': rec['metadata']}
-                result_q.put(matches)
+            result.append({'dist': dist, 'path': rec['path'], 'id': rec['_id'], 'metadata': rec.get('metadata', {})})
         except StopIteration:
             # do nothing...the cursor is exhausted
             break
-    result_q.put('STOP')
 
+    return result
